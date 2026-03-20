@@ -619,47 +619,123 @@ class Exp_Classification(Exp_Basic):
 
         return loss, acc, mf1, kappa
     
-    def get_detailed_analysis_dict(self, data_loader):
+    def fit_mahalanobis(self, train_loader):
+        """
+        Phase 1: Calibration. 
+        Run this ONCE using your ID training data before evaluation.
+        """
+        print(">>>>> Fitting Mahalanobis Parameters (Train ID Data) >>>>>")
+        self.model.eval()
+        all_latents = []
+        all_labels = []
+        
+        with torch.no_grad():
+            for batch_x, batch_y in tqdm(train_loader, desc="Extracting Train Latents"):
+                batch_x = batch_x.float().to(self.device)
+                _, _, _, _, i_1, _, _, _ = self.model(batch_x)
+                all_latents.append(i_1.cpu().numpy())
+                all_labels.append(batch_y.numpy())
+                
+        z = np.concatenate(all_latents, axis=0)
+        y = np.concatenate(all_labels, axis=0)
+        
+        unique_classes = np.unique(y)
+        self.class_means = [np.mean(z[y == c], axis=0) for c in unique_classes]
+        
+        # Calculate shared covariance across all ID classes
+        centered_z = np.zeros_like(z)
+        for i, c in enumerate(unique_classes):
+            centered_z[y == c] = z[y == c] - self.class_means[i]
+        
+        cov = np.cov(centered_z.T)
+        self.precision_matrix = np.linalg.pinv(cov) # Pseudo-inverse for stability
+        
+        # Calculate training distances to set a default threshold (95th percentile)
+        train_dists = self._calc_mahalanobis_dist(z)
+        self.mahal_threshold = np.percentile(train_dists, 95)
+        print(f"Mahalanobis fitted. 95% TPR Threshold: {self.mahal_threshold:.4f}")
+
+    def get_detailed_analysis_dict(self, data_loader, T=1000, noise=0.001):
+        """
+        Phase 2: Evaluation.
+        Calculates MSP, ODIN, and Mahalanobis for every sample in the loader.
+        """
         self.model.eval()
         self.linear_eval.eval()
         
-        # Temporary lists to hold data
         raw_latents, raw_logits, raw_targets = [], [], []
+        odin_scores = []
 
-        with torch.no_grad():
-            for batch_x, batch_y in data_loader:
-                batch_x = batch_x.float().to(self.device)
-                
-                # TimeDRL returns: t_1, t_2, x_p1, x_p2, i_1, i_2, i_p1, i_p2
-                # We only take i_1 (the primary instance representation) to match batch_y
+        for batch_x, batch_y in tqdm(data_loader, desc="Evaluating OOD Metrics"):
+            batch_x = batch_x.float().to(self.device)
+            
+            # 1. ODIN Score (Requires specialized forward/backward for perturbation)
+            batch_odin = self._get_odin_scores(batch_x, T=T, noise=noise)
+            odin_scores.append(batch_odin)
+            
+            # 2. Latents and Logits
+            with torch.no_grad():
                 _, _, _, _, i_1, _, _, _ = self.model(batch_x)
-                
                 logits = self.linear_eval(i_1)
-                
-                # Append to lists
                 raw_latents.append(i_1.detach().cpu().numpy())
                 raw_logits.append(logits.detach().cpu().numpy())
                 raw_targets.append(batch_y.numpy())
 
-        # Concatenate everything
         latents = np.concatenate(raw_latents, axis=0)
         logits = np.concatenate(raw_logits, axis=0)
         targets = np.concatenate(raw_targets, axis=0)
-
-        # FINAL SAFETY CLIP: Ensure arrays match in length (Dimension 0)
-        # This solves the IndexError permanently
         min_len = min(len(latents), len(targets))
+        latents, logits, targets = latents[:min_len], logits[:min_len], targets[:min_len]
+
+        # 3. Mahalanobis (Uses the means/precision saved during fit_mahalanobis)
+        mahal_dists = self._calc_mahalanobis_dist(latents)
         
-        probs = torch.softmax(torch.from_numpy(logits[:min_len]), dim=1).numpy()
-        conf = np.max(probs, axis=1)
-        preds = np.argmax(probs, axis=1)
+        probs = torch.softmax(torch.from_numpy(logits), dim=1).numpy()
 
         return {
-            "latents": latents[:min_len],
-            "logits": logits[:min_len],
+            "latents": latents,
+            "logits": logits,
             "probs": probs,
-            "preds": preds,
-            "targets": targets[:min_len],
-            "max_conf": conf
+            "targets": targets,
+            "preds": np.argmax(probs, axis=1),
+            "max_conf": np.max(probs, axis=1), # MSP Baseline
+            "mahal_distance": mahal_dists,     # Mahalanobis Metric
+            "odin_score": np.concatenate(odin_scores, axis=0)[:min_len], # ODIN Metric
         }
+
+    def _get_odin_scores(self, inputs, T, noise):
+        # We need gradients on the input to find the "perturbation direction"
+        inputs.requires_grad = True
+        _, _, _, _, i_1, _, _, _ = self.model(inputs)
+        logits = self.linear_eval(i_1) / T
+        
+        max_logits, _ = torch.max(logits, dim=1)
+        loss = torch.mean(max_logits)
+        
+        self.model.zero_grad()
+        self.linear_eval.zero_grad()
+        loss.backward()
+        
+        # Perturb input: noise in the direction that increases the max logit
+        gradient = torch.ge(inputs.grad.data, 0).float() - 0.5
+        perturbed_inputs = inputs.data - noise * (gradient * 2)
+        
+        with torch.no_grad():
+            _, _, _, _, i_1_p, _, _, _ = self.model(perturbed_inputs)
+            logits_p = self.linear_eval(i_1_p) / T
+            max_probs, _ = torch.max(torch.softmax(logits_p, dim=1), dim=1)
+            
+        return max_probs.cpu().numpy()
+
+    def _calc_mahalanobis_dist(self, latents):
+        if not hasattr(self, 'class_means') or not hasattr(self, 'precision_matrix'):
+            return np.zeros(len(latents))
+            
+        mahal_distances = []
+        for feat in latents:
+            # Distance to the closest of the 4 class centers
+            dists = [np.sqrt(np.maximum(np.dot(np.dot(feat - m, self.precision_matrix), (feat - m).T), 0)) 
+                     for m in self.class_means]
+            mahal_distances.append(min(dists))
+        return np.array(mahal_distances)
 
