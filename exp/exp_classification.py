@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import optim
 import os
 from pathlib import Path
@@ -703,28 +704,28 @@ class Exp_Classification(Exp_Basic):
             "odin_score": np.concatenate(odin_scores, axis=0)[:min_len], # ODIN Metric
         }
 
-    def _get_odin_scores(self, inputs, T, noise):
-        # We need gradients on the input to find the "perturbation direction"
+    def _get_odin_scores(self, inputs, T=1000, noise=0.001):
         inputs.requires_grad = True
-        _, _, _, _, i_1, _, _, _ = self.model(inputs)
-        logits = self.linear_eval(i_1) / T
         
-        max_logits, _ = torch.max(logits, dim=1)
-        loss = torch.mean(max_logits)
+        _, _, _, _, features, _, _, _ = self.model(inputs)
+        logits = self.linear_eval(features) / T
+        
+        pred = torch.argmax(logits, dim=1)
+        loss = F.cross_entropy(logits, pred)
         
         self.model.zero_grad()
         self.linear_eval.zero_grad()
         loss.backward()
         
-        # Perturb input: noise in the direction that increases the max logit
-        gradient = torch.ge(inputs.grad.data, 0).float() - 0.5
-        perturbed_inputs = inputs.data - noise * (gradient * 2)
+        gradient = torch.sign(inputs.grad)
+        perturbed_inputs = inputs - noise * gradient
         
         with torch.no_grad():
-            _, _, _, _, i_1_p, _, _, _ = self.model(perturbed_inputs)
-            logits_p = self.linear_eval(i_1_p) / T
-            max_probs, _ = torch.max(torch.softmax(logits_p, dim=1), dim=1)
-            
+            _, _, _, _, features_p, _, _, _ = self.model(perturbed_inputs)
+            logits_p = self.linear_eval(features_p) / T
+            probs = torch.softmax(logits_p, dim=1)
+            max_probs, _ = torch.max(probs, dim=1)
+        
         return max_probs.cpu().numpy()
 
     def _calc_mahalanobis_dist(self, latents):
