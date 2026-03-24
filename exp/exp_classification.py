@@ -9,6 +9,7 @@ import warnings
 import numpy as np
 from tqdm import tqdm
 from sklearn.metrics import accuracy_score, f1_score, cohen_kappa_score
+from sklearn.neighbors import NearestNeighbors
 from copy import deepcopy
 
 from dataset_loader.dataset_loader import load_classification_dataloader
@@ -656,6 +657,50 @@ class Exp_Classification(Exp_Basic):
         self.mahal_threshold = np.percentile(train_dists, 95)
         print(f"Mahalanobis fitted. 95% TPR Threshold: {self.mahal_threshold:.4f}")
 
+    def fit_knn(self, train_loader, k=10):
+        """
+        Phase 1: Calibration. 
+        Extracts and stores ID features to act as the reference bank.
+        """
+        print(f">>>>> Fitting k-NN Index (k={k}) >>>>>")
+        self.model.eval()
+        all_latents = []
+        self.knn_k = k
+        
+        with torch.no_grad():
+            for batch_x, _ in tqdm(train_loader, desc="Building ID Feature Bank"):
+                batch_x = batch_x.float().to(self.device)
+                # Extract features from the encoder
+                _, _, _, _, i_1, _, _, _ = self.model(batch_x)
+                
+                # Normalize features for better distance consistency (Optional but recommended)
+                feat = F.normalize(i_1, p=2, dim=1)
+                all_latents.append(feat.cpu().numpy())
+                
+        self.train_feature_bank = np.concatenate(all_latents, axis=0)
+        
+        # Initialize the NearestNeighbors engine
+        # algorithm='auto' or 'ball_tree' works well for high-dimensional latents
+        self.knn_engine = NearestNeighbors(n_neighbors=k, metric='euclidean', n_jobs=-1)
+        self.knn_engine.fit(self.train_feature_bank)
+        print(f"k-NN fitted with {len(self.train_feature_bank)} samples.")
+
+    def _calc_knn_dist(self, latents):
+        """
+        Calculates the distance to the k-th nearest neighbor.
+        """
+        if not hasattr(self, 'knn_engine'):
+            return np.zeros(len(latents))
+        
+        # Normalize test latents to match the bank
+        latents_norm = latents / (np.linalg.norm(latents, axis=1, keepdims=True) + 1e-10)
+        
+        # distances shape: (num_samples, k)
+        distances, _ = self.knn_engine.kneighbors(latents_norm)
+        
+        # The OOD score is the distance to the k-th nearest neighbor
+        return distances[:, -1]
+
     def get_detailed_analysis_dict(self, data_loader, T=1000, noise=0.001):
         """
         Phase 2: Evaluation.
@@ -690,6 +735,8 @@ class Exp_Classification(Exp_Basic):
 
         # 3. Mahalanobis (Uses the means/precision saved during fit_mahalanobis)
         mahal_dists = self._calc_mahalanobis_dist(latents)
+
+        knn_dists = self._calc_knn_dist(latents)
         
         probs = torch.softmax(torch.from_numpy(logits), dim=1).numpy()
 
@@ -701,6 +748,7 @@ class Exp_Classification(Exp_Basic):
             "preds": np.argmax(probs, axis=1),
             "max_conf": np.max(probs, axis=1), # MSP Baseline
             "mahal_distance": mahal_dists,     # Mahalanobis Metric
+            "knn_distance": knn_dists,
             "odin_score": np.concatenate(odin_scores, axis=0)[:min_len], # ODIN Metric
         }
 
